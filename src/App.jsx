@@ -119,6 +119,95 @@ function saveState(state) {
   } catch (e) { /* ignore */ }
 }
 
+// ─── Live Rate Fetching ─────────────────────────────────────────────────────
+
+async function fetchLiveRate(from, to) {
+  // Try multiple free APIs as fallbacks
+  const apis = [
+    {
+      name: "Frankfurter",
+      url: `https://api.frankfurter.dev/v2/rates?base=${from}&quotes=${to}`,
+      parse: (data) => data?.rates?.[to],
+    },
+    {
+      name: "ExchangeRate-API",
+      url: `https://open.er-api.com/v6/latest/${from}`,
+      parse: (data) => data?.rates?.[to],
+    },
+    {
+      name: "Currency-API",
+      url: `https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/${from.toLowerCase()}.min.json`,
+      parse: (data) => data?.[from.toLowerCase()]?.[to.toLowerCase()],
+    },
+  ];
+
+  for (const api of apis) {
+    try {
+      const res = await fetch(api.url, { signal: AbortSignal.timeout(5000) });
+      if (!res.ok) continue;
+      const data = await res.json();
+      const rate = api.parse(data);
+      if (rate && !isNaN(rate) && rate > 0) {
+        return { rate, source: api.name, time: new Date().toLocaleString() };
+      }
+    } catch (e) { continue; }
+  }
+  return null;
+}
+
+// ─── Export / Import ────────────────────────────────────────────────────────
+
+function exportToJSON(state) {
+  const blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `travel-fx-backup-${new Date().toISOString().slice(0, 10)}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function exportToCSV(state, home, travel) {
+  const rows = [["Type", "Date", "Description", "Method", `Amount (${home.code})`, `Amount (${travel.code})`, "Rate", "Market Rate", `Cost (${home.code})`, "Surcharge %"]];
+
+  (state.exchanges || []).forEach((ex) => {
+    rows.push(["Exchange", ex.date, ex.shop, "Cash", ex.homeAmount, ex.travelAmount, ex.rate, ex.marketRateAtTime || "", "", ""]);
+  });
+
+  (state.payments || []).forEach((p) => {
+    rows.push(["Spend", p.date, p.description, p.method === "cash" ? "Cash" : (p.cardName || "Card"), "", p.amount, "", "", p.costHome, p.surcharge || 0]);
+  });
+
+  const csv = rows.map((r) => r.map((v) => `"${v}"`).join(",")).join("\n");
+  const blob = new Blob([csv], { type: "text/csv" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `travel-fx-export-${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function importFromJSON(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const data = JSON.parse(e.target.result);
+        if (data && data.homeCurrency && Array.isArray(data.exchanges) && Array.isArray(data.payments)) {
+          resolve(data);
+        } else {
+          reject(new Error("Invalid backup file format"));
+        }
+      } catch (err) {
+        reject(err);
+      }
+    };
+    reader.onerror = () => reject(new Error("Failed to read file"));
+    reader.readAsText(file);
+  });
+}
+
 // ─── Components ─────────────────────────────────────────────────────────────
 
 function CurrencySelect({ value, onChange, label }) {
@@ -240,6 +329,10 @@ export default function TravelCurrencyCalc() {
   const [state, setState] = useState(null);
   const [tab, setTab] = useState("exchange");
   const [loading, setLoading] = useState(true);
+  const [liveRate, setLiveRate] = useState(null);
+  const [rateLoading, setRateLoading] = useState(false);
+  const [rateError, setRateError] = useState(null);
+  const fileInputRef = useRef(null);
 
   useEffect(() => {
     setState(loadState() || defaultState());
@@ -250,9 +343,43 @@ export default function TravelCurrencyCalc() {
     if (state && !loading) saveState(state);
   }, [state, loading]);
 
+  // Fetch live rate on load and when currencies change
+  const doFetchRate = useCallback(async (from, to) => {
+    if (!from || !to || from === to) return;
+    setRateLoading(true);
+    setRateError(null);
+    const result = await fetchLiveRate(from, to);
+    if (result) {
+      setLiveRate(result);
+    } else {
+      setRateError("Couldn't fetch rate");
+    }
+    setRateLoading(false);
+  }, []);
+
+  useEffect(() => {
+    if (state && !loading) {
+      doFetchRate(state.homeCurrency, state.travelCurrency);
+    }
+  }, [state?.homeCurrency, state?.travelCurrency, loading]);
+
   const update = useCallback((patch) => {
     setState((prev) => ({ ...prev, ...patch }));
   }, []);
+
+  const handleImport = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      const data = await importFromJSON(file);
+      if (confirm(`Import backup? This will replace all current data (${data.exchanges?.length || 0} exchanges, ${data.payments?.length || 0} payments).`)) {
+        setState(data);
+      }
+    } catch (err) {
+      alert("Failed to import: " + err.message);
+    }
+    e.target.value = "";
+  };
 
   if (loading || !state) {
     return (
@@ -278,9 +405,10 @@ export default function TravelCurrencyCalc() {
   const blendedRate = walletHome > 0 ? walletTravel / walletHome : 0;
 
   const tabs = [
-    { id: "exchange", label: "💱 Exchange", emoji: "💱" },
-    { id: "spend", label: "💸 Spend", emoji: "💸" },
-    { id: "wallet", label: "👛 Wallet", emoji: "👛" },
+    { id: "exchange", label: "💱 Exchange" },
+    { id: "spend", label: "💸 Spend" },
+    { id: "wallet", label: "👛 Wallet" },
+    { id: "data", label: "⚙️ Data" },
   ];
 
   return (
@@ -321,7 +449,7 @@ export default function TravelCurrencyCalc() {
         </div>
         <NumInput
           value={state.marketRate}
-          onChange={(v) => update({ marketRate: v, marketRateUpdated: new Date().toLocaleString() })}
+          onChange={(v) => update({ marketRate: v, marketRateUpdated: new Date().toLocaleString(), marketRateSource: "Manual" })}
           placeholder="e.g. 4.1463"
           prefix="1 ="
           suffix={travel.code}
@@ -329,16 +457,85 @@ export default function TravelCurrencyCalc() {
         />
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", margin: "6px 0 0" }}>
           <p style={{ margin: 0, fontSize: 11, color: "#475569" }}>
-            Mid-market rate · {state.marketRateUpdated ? `Updated ${state.marketRateUpdated}` : "Not set yet"}
+            {state.marketRateUpdated
+              ? `${state.marketRateSource || "Manual"} · ${state.marketRateUpdated}`
+              : "Not set yet"}
           </p>
           <a
-            href={`https://www.google.com/search?q=1+${home.code}+to+${travel.code}`}
+            href={`https://www.xe.com/currencyconverter/convert/?From=${home.code}&To=${travel.code}`}
             target="_blank"
             rel="noopener noreferrer"
             style={{ fontSize: 11, color: "#818cf8", textDecoration: "none", fontWeight: 600 }}
           >
-            Check rate ↗
+            XE.com ↗
           </a>
+        </div>
+
+        {/* Live rate bar */}
+        <div style={{
+          marginTop: 8,
+          padding: "8px 12px",
+          background: "#1e293b",
+          borderRadius: 10,
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+        }}>
+          <div>
+            <span style={{ fontSize: 11, color: "#64748b", fontWeight: 600 }}>Live rate: </span>
+            {rateLoading && <span style={{ fontSize: 12, color: "#94a3b8" }}>Fetching...</span>}
+            {rateError && <span style={{ fontSize: 12, color: "#f87171" }}>{rateError}</span>}
+            {liveRate && !rateLoading && (
+              <span style={{ fontSize: 13, fontWeight: 700, fontFamily: "'JetBrains Mono', monospace", color: "#e2e8f0" }}>
+                {fmt(liveRate.rate, 4)}
+              </span>
+            )}
+            {liveRate && !rateLoading && (
+              <span style={{ fontSize: 10, color: "#475569", marginLeft: 6 }}>
+                via {liveRate.source}
+              </span>
+            )}
+          </div>
+          <div style={{ display: "flex", gap: 6 }}>
+            {liveRate && !rateLoading && (
+              <button
+                onClick={() => update({
+                  marketRate: String(liveRate.rate),
+                  marketRateUpdated: new Date().toLocaleString(),
+                  marketRateSource: liveRate.source,
+                })}
+                style={{
+                  background: "rgba(129,140,248,0.15)",
+                  border: "none",
+                  borderRadius: 6,
+                  color: "#818cf8",
+                  padding: "4px 10px",
+                  fontSize: 11,
+                  fontWeight: 700,
+                  cursor: "pointer",
+                  fontFamily: "inherit",
+                }}
+              >
+                Use it
+              </button>
+            )}
+            <button
+              onClick={() => doFetchRate(state.homeCurrency, state.travelCurrency)}
+              disabled={rateLoading}
+              style={{
+                background: "rgba(148,163,184,0.1)",
+                border: "none",
+                borderRadius: 6,
+                color: "#94a3b8",
+                padding: "4px 8px",
+                fontSize: 13,
+                cursor: rateLoading ? "default" : "pointer",
+                fontFamily: "inherit",
+              }}
+            >
+              ↻
+            </button>
+          </div>
         </div>
       </div>
 
@@ -414,30 +611,25 @@ export default function TravelCurrencyCalc() {
             blendedRate={blendedRate}
           />
         )}
+        {tab === "data" && (
+          <DataTab
+            state={state}
+            setState={setState}
+            home={home}
+            travel={travel}
+            fileInputRef={fileInputRef}
+          />
+        )}
       </div>
 
-      {/* Reset */}
-      <div style={{ padding: "20px 12px", textAlign: "center" }}>
-        <button
-          onClick={() => {
-            if (confirm("Reset all data? This cannot be undone.")) {
-              setState(defaultState());
-            }
-          }}
-          style={{
-            background: "transparent",
-            border: "1px solid #1e293b",
-            borderRadius: 10,
-            color: "#475569",
-            padding: "8px 20px",
-            fontSize: 12,
-            cursor: "pointer",
-            fontFamily: "inherit",
-          }}
-        >
-          Reset All Data
-        </button>
-      </div>
+      {/* Hidden file input for import */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept=".json"
+        onChange={handleImport}
+        style={{ display: "none" }}
+      />
     </div>
   );
 }
@@ -1115,6 +1307,114 @@ function WalletTab({ state, home, travel, marketRate, walletHome, walletTravel, 
           </div>
         </Card>
       )}
+    </div>
+  );
+}
+
+// ─── Data Tab ───────────────────────────────────────────────────────────────
+
+function DataTab({ state, setState, home, travel, fileInputRef }) {
+  const exchCount = state.exchanges?.length || 0;
+  const payCount = state.payments?.length || 0;
+  const cardCount = state.cards?.length || 0;
+
+  const btnStyle = (color, bg) => ({
+    width: "100%",
+    padding: "14px",
+    borderRadius: 12,
+    border: "none",
+    background: bg,
+    color: color,
+    fontSize: 14,
+    fontWeight: 700,
+    cursor: "pointer",
+    fontFamily: "inherit",
+    transition: "all 0.15s",
+  });
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+      {/* Summary */}
+      <Card title="Your Data">
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13 }}>
+            <span style={{ color: "#94a3b8" }}>Currency pair</span>
+            <span style={{ color: "#e2e8f0", fontWeight: 600 }}>{home.code} → {travel.code}</span>
+          </div>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13 }}>
+            <span style={{ color: "#94a3b8" }}>Exchanges recorded</span>
+            <span style={{ color: "#e2e8f0", fontWeight: 600 }}>{exchCount}</span>
+          </div>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13 }}>
+            <span style={{ color: "#94a3b8" }}>Payments recorded</span>
+            <span style={{ color: "#e2e8f0", fontWeight: 600 }}>{payCount}</span>
+          </div>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13 }}>
+            <span style={{ color: "#94a3b8" }}>Cards configured</span>
+            <span style={{ color: "#e2e8f0", fontWeight: 600 }}>{cardCount}</span>
+          </div>
+        </div>
+      </Card>
+
+      {/* Export */}
+      <Card title="Export">
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          <p style={{ margin: 0, fontSize: 12, color: "#64748b" }}>
+            JSON backup can be re-imported later. CSV is for viewing in Excel / Google Sheets.
+          </p>
+          <button
+            onClick={() => exportToJSON(state)}
+            style={btnStyle("#c7d2fe", "linear-gradient(135deg, #6366f1, #818cf8)")}
+          >
+            📦 Export JSON Backup
+          </button>
+          <button
+            onClick={() => exportToCSV(state, home, travel)}
+            style={btnStyle("#bbf7d0", "linear-gradient(135deg, #059669, #10b981)")}
+          >
+            📊 Export to CSV (Excel)
+          </button>
+        </div>
+      </Card>
+
+      {/* Import */}
+      <Card title="Import">
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          <p style={{ margin: 0, fontSize: 12, color: "#64748b" }}>
+            Restore from a JSON backup. This will replace all current data.
+          </p>
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            style={btnStyle("#e2e8f0", "#1e293b")}
+          >
+            📂 Import JSON Backup
+          </button>
+        </div>
+      </Card>
+
+      {/* Reset */}
+      <Card title="Danger Zone" style={{ borderColor: "rgba(239,68,68,0.2)" }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          <p style={{ margin: 0, fontSize: 12, color: "#64748b" }}>
+            Permanently delete all exchanges, payments, and settings.
+          </p>
+          <button
+            onClick={() => {
+              if (confirm("Reset ALL data? This cannot be undone. Consider exporting a backup first.")) {
+                setState(defaultState());
+              }
+            }}
+            style={btnStyle("#fca5a5", "rgba(239,68,68,0.15)")}
+          >
+            🗑️ Reset All Data
+          </button>
+        </div>
+      </Card>
+
+      {/* Attribution */}
+      <p style={{ textAlign: "center", fontSize: 10, color: "#334155", padding: "8px 0" }}>
+        Live rates by <a href="https://www.exchangerate-api.com" target="_blank" rel="noopener noreferrer" style={{ color: "#475569" }}>ExchangeRate-API</a> & <a href="https://frankfurter.dev" target="_blank" rel="noopener noreferrer" style={{ color: "#475569" }}>Frankfurter</a>
+      </p>
     </div>
   );
 }
